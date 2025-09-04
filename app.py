@@ -28,7 +28,7 @@ def _cbf():
 
 @st.cache_resource
 def _cf():
-    model = try_load_cf('artifacts/cf_model.h5')  # opsional
+    model = try_load_cf('artifacts/cf_model.h5')  # opsional; butuh TF jika benar2 dipakai
     u2e, p2e, _, _ = build_cf_maps(ratings)
     return model, u2e, p2e
 
@@ -37,7 +37,7 @@ cf_model, u2e, p2e = _cf()
 
 # ---------- Helpers ----------
 def _price_to_float(s: pd.Series) -> pd.Series:
-    # ambil angka saja (hilangkan Rp, koma, titik, dll)
+    """Parse harga: ambil angka dari string (buang Rp, titik, koma, dll)."""
     num = (
         s.astype(str)
          .str.replace(r'[^0-9.,]', '', regex=True)
@@ -47,16 +47,24 @@ def _price_to_float(s: pd.Series) -> pd.Series:
     return pd.to_numeric(num, errors='coerce')
 
 def _apply_filters(df: pd.DataFrame, cities, cats, pmin, pmax):
+    """Filter city/category + rentang harga (mask diselaraskan ke urutan baris df)."""
+    out = df.copy()
+
     if cities:
-        df = df[df['City'].isin(cities)]
+        out = out[out.get('City').isin(cities)]
     if cats:
-        df = df[df['Category'].isin(cats)]
-    # filter harga bila Price dapat diparse
-    if pmin is not None and pmax is not None:
-        price_num = _price_to_float(places.set_index('Place_Id').loc[df['Place_Id'], 'Price'])
-        m = (price_num >= pmin) & (price_num <= pmax)
-        df = df.loc[m]
-    return df
+        out = out[out.get('Category').isin(cats)]
+
+    can_price = (pmin is not None) and (pmax is not None) and ('Place_Id' in out.columns)
+    if can_price and not out.empty:
+        # peta harga per Place_Id → parse -> selaraskan ke urutan baris 'out'
+        price_map = _price_to_float(places.set_index('Place_Id')['Price'])
+        price_for_rows = price_map.reindex(out['Place_Id'])
+        mask = (price_for_rows >= pmin) & (price_for_rows <= pmax)
+        mask = mask.fillna(False).to_numpy()   # panjang mask = jumlah baris 'out'
+        out = out.loc[mask]
+
+    return out
 
 def _similar_places(base_name: str, top_n=10):
     if base_name not in cos_df.index:
@@ -180,7 +188,7 @@ with tab2:
 # ---------- Tab: CF (opsional) ----------
 with tab3:
     st.subheader('CF saja (opsional)')
-    st.caption('Butuh artifacts/cf_model.h5 + TensorFlow. Kalau tidak ada, tab ini mungkin kosong.')
+    st.caption('Butuh artifacts/cf_model.h5 dan TensorFlow. Kalau tidak ada, tab ini mungkin kosong.')
     if st.button('Hitung rekomendasi (CF)'):
         out = get_cf_recs(user_id, places, ratings, cf_model, u2e, p2e, topn)
         if out is None:
