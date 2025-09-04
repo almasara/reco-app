@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd  # <-- penting untuk selectbox & tipe data
 from reco_utils import (
     load_data, build_cbf_index, try_load_cf, build_cf_maps,
     get_cbf_recs, get_cf_recs, get_hybrid_recs
@@ -34,16 +35,21 @@ def _cf():
 places_cbf, vec, X, cos_df = _cbf()
 cf_model, u2e, p2e = _cf()
 
+# ---------- Sidebar (AMAN untuk User_Id string/angka) ----------
 with st.sidebar:
     st.header('Pengaturan')
-    user_id = st.number_input(
-        'User ID',
-        min_value=int(ratings['User_Id'].min()),
-        max_value=int(ratings['User_Id'].max()),
-        value=int(ratings['User_Id'].min()),
-        step=1
-    )
-    topn = st.slider('Top-N rekomendasi', 5, 30, 10)
+
+    # Ambil opsi User_Id apa adanya (string atau numeric)
+    uid_series = ratings['User_Id']
+    user_choices = uid_series.dropna().unique().tolist()
+    if not user_choices:
+        st.error("Dataset rating kosong: kolom User_Id tidak punya data.")
+        st.stop()
+
+    # Tidak pakai number_input agar aman untuk string IDs
+    user_id = st.selectbox('User ID', user_choices, index=0)
+
+    topn  = st.slider('Top-N rekomendasi', 5, 30, 10)
     alpha = st.slider('Bobot CBF (alpha)', 0.0, 1.0, 0.2, 0.05)
     st.caption('Semakin besar alpha → semakin menekankan CBF. CF butuh artifacts/cf_model.h5 + TensorFlow.')
 
