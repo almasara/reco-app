@@ -5,3 +5,4 @@ scikit-learn==1.7.1
 scipy==1.16.1
 # Jika (nanti) mau CF model .h5, pindah runtime ke Python 3.10/3.11 lalu tambahkan:
 # tensorflow==2.19.1
+# build-bump-1
