@@ -1,7 +1,7 @@
-streamlit==1.36.0
-pandas==2.2.2
-numpy==1.26.4
-scikit-learn==1.4.2
-scipy==1.11.4
-# Jika nanti pakai CF (model .h5), tambah baris ini:
+streamlit==1.49.1
+pandas==2.3.2
+numpy==2.3.2
+scikit-learn==1.7.1
+scipy==1.16.1
+# Jika (nanti) mau CF model .h5, pindah runtime ke Python 3.10/3.11 lalu tambahkan:
 # tensorflow==2.19.1
