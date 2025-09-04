@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+scikit-learn
+scipy
+tensorflow==2.19.1
+# Jika ingin mengaktifkan CF dengan model .h5, tambahkan baris di bawah ini:
+# tensorflow==2.19.1
