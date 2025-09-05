@@ -1,359 +1,196 @@
+# app.py — Landing + Form Preferensi + Kartu Hasil
+# Versi ini mengganti "rating" menjadi "price category" (free/low/medium/high/blank)
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from reco_utils import (
-    load_data, build_cbf_index, try_load_cf, build_cf_maps,
-    get_cbf_recs, get_cf_recs, get_hybrid_recs
-)
+from reco_utils import load_data, build_cbf_index
 
-st.set_page_config(page_title='Hybrid Tourism Recommender', page_icon='🧭', layout='wide')
-st.title('🧭 Hybrid Tourism Recommender (CBF + optional CF)')
+st.set_page_config(page_title="Sistem Rekomendasi Wisata", page_icon="🧭", layout="wide")
 
-# ===================== Load data =====================
+# ============ STYLE ============
+st.markdown("""
+<style>
+.main .block-container {max-width: 1100px; padding-top: 1.5rem;}
+.hero {text-align:center; padding: 3.0rem 0 2.0rem 0;}
+.hero h1 {font-size: 3rem; margin: 0 0 .5rem 0;}
+.hero p  {font-size: 1.1rem; color: #5a5f69;}
+.hero .btn {display:inline-block; padding:.8rem 1.6rem; background:#2f6df6; color:#fff;
+            border-radius: .6rem; text-decoration:none; font-weight:600;}
+.section-title {font-size: 2rem; font-weight: 800; margin: 1.8rem 0 .8rem 0;}
+.card {border:1px solid #EEE; border-radius: 12px; padding: 16px; margin-bottom: 16px; background:#fff;}
+.card h3{margin:.1rem 0 .4rem 0;}
+.card small{color:#6b7280;}
+div[data-baseweb="select"] {min-width: 240px;}
+</style>
+""", unsafe_allow_html=True)
+
+# ============ DATA ============
 try:
     places, ratings = load_data()
 except Exception as e:
-    st.error(f'⚠️ {e}')
-    st.markdown('''
-**Cara pakai:**
-1) Taruh 2 file di root repo:
-   - `tourism_with_id.csv`: kolom wajib `Place_Id, Place_Name, Category, City, Description, Price`
-   - `tourism_rating.csv`: kolom wajib `User_Id, Place_Id, Place_Ratings`
-2) Commit & deploy ulang.
-''')
+    st.error(f"⚠️ {e}")
     st.stop()
 
-@st.cache_resource
-def _cbf():
-    # returns: places_cbf, vectorizer, X_tfidf, cosine_df
-    return build_cbf_index(places)
+# TF-IDF index untuk keyword matching
+places_cbf, vectorizer, X_tfidf, cos_df = build_cbf_index(places)
 
-@st.cache_resource
-def _cf():
-    model = try_load_cf('artifacts/cf_model.h5')  # opsional
-    u2e, p2e, _, _ = build_cf_maps(ratings)
-    return model, u2e, p2e
-
-places_cbf, vectorizer, X_tfidf, cos_df = _cbf()
-cf_model, u2e, p2e = _cf()
-
-# ===================== Helpers =====================
+# ---- Helper parsing harga & membuat kategori harga ----
 def _price_to_float(s: pd.Series) -> pd.Series:
-    """Parse harga string -> float (buang Rp, titik, koma)."""
-    num = (
-        s.astype(str)
-         .str.replace(r'[^0-9.,]', '', regex=True)
-         .str.replace('.', '', regex=False)
-         .str.replace(',', '.', regex=False)
+    num = (s.astype(str)
+             .str.replace(r"[^0-9.,]", "", regex=True)
+             .str.replace(".", "", regex=False)
+             .str.replace(",", ".", regex=False))
+    return pd.to_numeric(num, errors="coerce")
+
+price_num = _price_to_float(places["Price"])
+# Ambil kuantil agar adaptif ke dataset (≈ 33% dan 66%)
+q1 = price_num.dropna().quantile(0.33) if price_num.notna().any() else np.nan
+q2 = price_num.dropna().quantile(0.66) if price_num.notna().any() else np.nan
+
+def _price_cat(v: float) -> str | None:
+    if pd.isna(v):
+        return None
+    if v == 0:
+        return "free"
+    if pd.isna(q1) or pd.isna(q2):
+        # fallback kalau semua harga NaN → tanpa kategori
+        return None
+    if v <= q1:
+        return "low"
+    if v <= q2:
+        return "medium"
+    return "high"
+
+places["Price_Num"] = price_num
+places["Price_Cat"] = price_num.apply(_price_cat)
+
+# Pilihan unik
+CITIES = ["Semua"] + sorted(places["City"].dropna().unique().tolist())
+CATS   = ["Semua"] + sorted(places["Category"].dropna().unique().tolist())
+PRICE_CATS = ["", "free", "low", "medium", "high"]  # "" = blank (abaikan)
+
+# ============ HELPER REKOMENDASI ============
+def preference_score(df: pd.DataFrame, keywords: str, cat: str, city: str) -> pd.Series:
+    """Skor gabungan: keyword (TF-IDF) + match kategori + match kota."""
+    # 1) keyword via TF-IDF
+    q = keywords.strip()
+    if q:
+        q_vec = vectorizer.transform([q])
+        sim_kw = cosine_similarity(X_tfidf, q_vec).ravel()
+        sim_kw = (sim_kw - sim_kw.min()) / (sim_kw.max() - sim_kw.min()) if sim_kw.max() > sim_kw.min() else np.zeros_like(sim_kw)
+    else:
+        sim_kw = np.zeros(len(df))
+
+    # 2) kategori (1/0)
+    if cat and cat != "Semua":
+        cat_score = (df["Category"].astype(str).str.lower() == cat.lower()).astype(float).to_numpy()
+    else:
+        cat_score = np.zeros(len(df))
+
+    # 3) kota (1/0)
+    if city and city != "Semua":
+        city_score = (df["City"].astype(str).str.lower() == city.lower()).astype(float).to_numpy()
+    else:
+        city_score = np.zeros(len(df))
+
+    # bobot sederhana
+    w_kw, w_cat, w_city = 0.6, 0.25, 0.15
+    return (w_kw*sim_kw + w_cat*cat_score + w_city*city_score)
+
+def make_cards(df: pd.DataFrame):
+    """Render grid 2 kolom berisi kartu tempat."""
+    cols = st.columns(2)
+    for i, (_, row) in enumerate(df.iterrows()):
+        price_text = row.get("Price", "")
+        price_cat  = row.get("Price_Cat", None)
+        price_line = f"Harga: {price_cat}" if pd.notna(price_cat) and price_cat else f"Harga: {price_text}"
+        with cols[i % 2]:
+            st.markdown(
+                f"""
+                <div class="card">
+                  <h3>{row['Place_Name']}</h3>
+                  <small>Kategori: {row['Category']}</small><br>
+                  <small>Lokasi: {row['City']}</small><br>
+                  <small>{price_line}</small><br>
+                  <small><a href="https://www.google.com/maps/search/?api=1&query={row['Place_Name']} {row['City']}"
+                            target="_blank">Lihat di Google Maps</a></small>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+# ============ HERO ============
+st.markdown(
+    """
+<div class="hero">
+  <h1>Sistem Rekomendasi Wisata</h1>
+  <p>Temukan destinasi wisata sesuai preferensi Anda.</p>
+  <a class="btn" href="#form">Mulai</a>
+</div>
+""",
+    unsafe_allow_html=True
+)
+
+# ============ FORM PREFERENSI ============
+st.markdown('<div id="form"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Masukkan Preferensi</div>', unsafe_allow_html=True)
+
+c1, c2 = st.columns(2)
+with c1:
+    pilih_kategori = st.selectbox("Kategori", CATS, index=0)
+    price_cat_input = st.selectbox(
+        "Enter the price category (free/low/medium/high or blank)",
+        PRICE_CATS, index=0, help="Pilih kosong (blank) untuk mengabaikan harga"
     )
-    return pd.to_numeric(num, errors='coerce')
+with c2:
+    pilih_lokasi = st.selectbox("Lokasi", CITIES, index=0)
+    keywords = st.text_input("Kata Kunci (opsional)", placeholder="contoh: alam hijau air terjun instagramable")
 
-def _apply_filters(df: pd.DataFrame, cities, cats, pmin, pmax):
-    """Filter city/category + rentang harga. Mask diselaraskan ke urutan baris df."""
-    out = df.copy()
-    if cities:
-        out = out[out.get('City').isin(cities)]
-    if cats:
-        out = out[out.get('Category').isin(cats)]
+topn = st.slider("Jumlah rekomendasi", 4, 24, 8, 2)
+go = st.button("Dapatkan Rekomendasi", type="primary")
 
-    can_price = (pmin is not None) and (pmax is not None) and ('Place_Id' in out.columns)
-    if can_price and not out.empty:
-        price_map = _price_to_float(places.set_index('Place_Id')['Price'])
-        price_for_rows = price_map.reindex(out['Place_Id'])
-        mask = (price_for_rows >= pmin) & (price_for_rows <= pmax)
-        mask = mask.fillna(False).to_numpy()
-        out = out.loc[mask]
-    return out
+# ============ HASIL ============
+st.markdown('<div class="section-title">Hasil Rekomendasi</div>', unsafe_allow_html=True)
 
-def _add_maps_link(df: pd.DataFrame) -> pd.DataFrame:
-    def maps_url(row):
-        q = f"{row['Place_Name']} {row['City']}".replace(' ', '+')
-        return f"https://www.google.com/maps/search/?api=1&query={q}"
-    df = df.copy()
-    df['Maps'] = df.apply(maps_url, axis=1)
-    return df
+if go:
+    df = places.copy()
 
-# ====== Preference-based recommender (tanpa riwayat user) ======
-def get_preference_recs(
-    places_df: pd.DataFrame,
-    vectorizer, X_tfidf,
-    liked_cats=None, liked_cities=None,
-    budget_min=None, budget_max=None,
-    keywords:str="", top_n:int=10,
-    w_kw:float=0.5, w_cat:float=0.25, w_city:float=0.15, w_price:float=0.10
-):
-    liked_cats = liked_cats or []
-    liked_cities = liked_cities or []
+    # Filter kategori & lokasi (opsional)
+    if pilih_kategori != "Semua":
+        df = df[df["Category"] == pilih_kategori]
+    if pilih_lokasi != "Semua":
+        df = df[df["City"] == pilih_lokasi]
 
-    # --- 1) Skor kata kunci (TF-IDF) ---
-    query_tokens = []
-    if keywords:
-        query_tokens.append(keywords)
-    if liked_cats:
-        query_tokens.append(" ".join(liked_cats) * 2)  # boost kategori
-    if liked_cities:
-        query_tokens.append(" ".join(liked_cities))
-    if not query_tokens:
-        # fallback pakai nama+kategori agar tetap ada sinyal
-        query_tokens.append("tourism travel wisata " + " ".join(places_df['Category'].head(50).astype(str).tolist()))
-    query_text = " ".join(query_tokens)
-    q_vec = vectorizer.transform([query_text])
-    sim_kw = cosine_similarity(X_tfidf, q_vec).ravel()
-    # normalisasi 0..1 aman
-    if sim_kw.max() > sim_kw.min():
-        sim_kw = (sim_kw - sim_kw.min()) / (sim_kw.max() - sim_kw.min())
+    # Filter kategori harga (free/low/medium/high) jika diisi
+    if price_cat_input:
+        df = df[df["Price_Cat"].fillna("") == price_cat_input]
+
+    # Hitung skor preferensi (keyword + match cat & city)
+    df["Pref_Score"] = preference_score(df, keywords, pilih_kategori, pilih_lokasi)
+
+    # fallback kalau kosong → longgarkan harga dulu, lalu kota/kategori
+    if df.empty and price_cat_input:
+        df = places.copy()
+        if pilih_kategori != "Semua":
+            df = df[df["Category"] == pilih_kategori]
+        if pilih_lokasi != "Semua":
+            df = df[df["City"] == pilih_lokasi]
+        df["Pref_Score"] = preference_score(df, keywords, pilih_kategori, pilih_lokasi)
+
+    if df.empty:
+        df = places.copy()
+        df["Pref_Score"] = preference_score(df, keywords, "Semua", "Semua")
+
+    out = df.sort_values("Pref_Score", ascending=False).head(topn)
+
+    if out.empty:
+        st.info("Tidak ada hasil dengan preferensi saat ini. Coba kosongkan kategori harga atau longgarkan pilihan.")
     else:
-        sim_kw = np.zeros_like(sim_kw)
-
-    # --- 2) Skor kategori (match 1/0) ---
-    cat_series = places_df['Category'].astype(str).str.lower()
-    if liked_cats:
-        liked_set = set([c.lower() for c in liked_cats])
-        cat_score = cat_series.apply(lambda x: 1.0 if any(c in x for c in liked_set) else 0.0).to_numpy()
-    else:
-        cat_score = np.zeros(len(places_df))
-
-    # --- 3) Skor kota (match 1/0) ---
-    city_series = places_df['City'].astype(str).str.lower()
-    if liked_cities:
-        city_set = set([c.lower() for c in liked_cities])
-        city_score = city_series.apply(lambda x: 1.0 if x in city_set else 0.0).to_numpy()
-    else:
-        city_score = np.zeros(len(places_df))
-
-    # --- 4) Skor harga (dalam rentang = 1, di luar = 0) ---
-    price_num = _price_to_float(places_df['Price'])
-    if budget_min is not None and budget_max is not None:
-        price_score = ((price_num >= budget_min) & (price_num <= budget_max)).astype(float).fillna(0.0).to_numpy()
-    else:
-        price_score = np.zeros(len(places_df))
-
-    # --- Gabung skor (dibobot) ---
-    # Normalisasi bobot kalau total > 0
-    w = np.array([w_kw, w_cat, w_city, w_price], dtype=float)
-    w = w / w.sum() if w.sum() > 0 else np.array([1, 0, 0, 0], dtype=float)
-    total = w[0]*sim_kw + w[1]*cat_score + w[2]*city_score + w[3]*price_score
-
-    df = places_df[['Place_Id','Place_Name','Category','City']].copy()
-    df['Pref_Score'] = total
-    df = df.sort_values('Pref_Score', ascending=False).head(top_n)
-    return df
-
-# ===================== Session state =====================
-if 'shortlist' not in st.session_state:
-    st.session_state['shortlist'] = pd.DataFrame(columns=['Place_Id','Place_Name','Category','City'])
-
-# ===================== Sidebar: Filter global =====================
-with st.sidebar:
-    st.header('Filter preferensi (opsional)')
-    cities_all = sorted(places['City'].dropna().unique().tolist())
-    cats_all   = sorted(places['Category'].dropna().unique().tolist())
-
-    global_cities = st.multiselect('City', cities_all, default=[])
-    global_cats   = st.multiselect('Category', cats_all, default=[])
-
-    price_num_all = _price_to_float(places['Price'])
-    if price_num_all.notna().any():
-        lo = float(price_num_all.dropna().quantile(0.05))
-        hi = float(price_num_all.dropna().quantile(0.95))
-        g_pmin, g_pmax = st.slider('Rentang harga (perkiraan)', min_value=0.0, max_value=max(hi, 1.0),
-                                   value=(lo, hi), step=1000.0)
-    else:
-        g_pmin = g_pmax = None
-        st.caption('Harga tidak dapat diparse → filter harga dinonaktifkan.')
-
-# ===================== Tabs =====================
-tab0, tab1, tab2, tab3, tab4 = st.tabs([
-    'Preferensi langsung',      # <== baru
-    'Hybrid (riwayat user)',
-    'CBF saja',
-    'CF saja (opsional)',
-    'Mirip tempat ini'
-])
-
-# ---------- Tab 0: Preferensi langsung ----------
-with tab0:
-    st.subheader('🎯 Rekomendasi dari preferensi yang kamu isi (tanpa riwayat rating)')
-
-    c1, c2 = st.columns(2)
-    with c1:
-        pref_cats = st.multiselect('Saya suka kategori', cats_all, default=[])
-        pref_cities = st.multiselect('Saya ingin ke kota', cities_all, default=[])
-        kw = st.text_area('Kata kunci (opsional)', placeholder='Contoh: alam hijau air terjun instagramable...')
-    with c2:
-        st.caption('Bobot komponen skor (total akan dinormalisasi):')
-        w_kw   = st.slider('Bobot Kata Kunci', 0.0, 1.0, 0.5, 0.05)
-        w_cat  = st.slider('Bobot Kategori',    0.0, 1.0, 0.25, 0.05)
-        w_city = st.slider('Bobot Kota',        0.0, 1.0, 0.15, 0.05)
-        w_prc  = st.slider('Bobot Harga',       0.0, 1.0, 0.10, 0.05)
-
-    topn_pref = st.slider('Top-N rekomendasi', 5, 30, 10, key='topn_pref')
-
-    if st.button('Hitung rekomendasi (Preferensi)'):
-        out = get_preference_recs(
-            places, vectorizer, X_tfidf,
-            liked_cats=pref_cats, liked_cities=pref_cities,
-            budget_min=g_pmin, budget_max=g_pmax,
-            keywords=kw, top_n=topn_pref,
-            w_kw=w_kw, w_cat=w_cat, w_city=w_city, w_price=w_prc
-        )
-        out = _apply_filters(out, global_cities, global_cats, g_pmin, g_pmax)
-        out = _add_maps_link(out)
-
-        if out.empty:
-            st.info('Tidak ada hasil dengan preferensi & filter saat ini. Coba longgarkan pilihan kota/kategori/budget.')
-        else:
-            out_disp = out[['Place_Id','Place_Name','Category','City','Pref_Score','Maps']].copy()
-            out_disp.insert(0, 'Pilih', False)
-            edited = st.data_editor(
-                out_disp, use_container_width=True, hide_index=True,
-                column_config={
-                    'Pilih': st.column_config.CheckboxColumn('Pilih'),
-                    'Maps': st.column_config.LinkColumn('Maps')
-                }
-            )
-            chosen = edited[edited['Pilih']]
-            if st.button('➕ Tambah ke Shortlist (Preferensi)', disabled=chosen.empty):
-                keep = ['Place_Id','Place_Name','Category','City']
-                st.session_state['shortlist'] = pd.concat(
-                    [st.session_state['shortlist'], chosen[keep]], ignore_index=True
-                ).drop_duplicates(subset=['Place_Id'])
-                st.success('Ditambahkan ke Shortlist.')
-
-# ---------- Tab 1: Hybrid (riwayat user) ----------
-with tab1:
-    st.subheader('Hybrid (CBF + CF opsional) dari riwayat User_ID')
-    uid_series = ratings['User_Id']
-    user_choices = uid_series.dropna().unique().tolist()
-    user_id = st.selectbox('User ID', user_choices, index=0, key='uid_hybrid')
-    alpha = st.slider('Bobot CBF (alpha)', 0.0, 1.0, 0.2, 0.05, key='alpha_hybrid')
-    topn_h = st.slider('Top-N rekomendasi', 5, 30, 10, key='topn_h')
-
-    if st.button('Hitung rekomendasi (Hybrid)'):
-        out = get_hybrid_recs(user_id, places, ratings, cos_df, cf_model, u2e, p2e, topn_h, alpha)
-        out = _apply_filters(out, global_cities, global_cats, g_pmin, g_pmax)
-        out = _add_maps_link(out)
-        if out.empty:
-            st.info('Tidak ada hasil dengan filter saat ini.')
-        else:
-            out_disp = out[['Place_Id','Place_Name','Category','City','Hybrid_Score','Maps']].copy()
-            out_disp.insert(0, 'Pilih', False)
-            edited = st.data_editor(
-                out_disp, use_container_width=True, hide_index=True,
-                column_config={'Pilih': st.column_config.CheckboxColumn('Pilih'),
-                               'Maps': st.column_config.LinkColumn('Maps')}
-            )
-            chosen = edited[edited['Pilih']]
-            if st.button('➕ Tambah ke Shortlist (Hybrid)', disabled=chosen.empty):
-                keep = ['Place_Id','Place_Name','Category','City']
-                st.session_state['shortlist'] = pd.concat(
-                    [st.session_state['shortlist'], chosen[keep]], ignore_index=True
-                ).drop_duplicates(subset=['Place_Id'])
-                st.success('Ditambahkan ke Shortlist.')
-
-# ---------- Tab 2: CBF saja ----------
-with tab2:
-    st.subheader('CBF saja (riwayat User_ID)')
-    user_id_cbf = st.selectbox('User ID', user_choices, index=0, key='uid_cbf')
-    topn_cbf = st.slider('Top-N rekomendasi', 5, 30, 10, key='topn_cbf')
-
-    if st.button('Hitung rekomendasi (CBF)'):
-        out = get_cbf_recs(user_id_cbf, places, ratings, cos_df, topn_cbf)
-        out = _apply_filters(out, global_cities, global_cats, g_pmin, g_pmax)
-        out = _add_maps_link(out)
-        if out.empty:
-            st.info('Tidak ada hasil dengan filter saat ini.')
-        else:
-            out_disp = out[['Place_Id','Place_Name','Category','City','CBF_Score','Maps']].copy()
-            out_disp.insert(0, 'Pilih', False)
-            edited = st.data_editor(
-                out_disp, use_container_width=True, hide_index=True,
-                column_config={'Pilih': st.column_config.CheckboxColumn('Pilih'),
-                               'Maps': st.column_config.LinkColumn('Maps')}
-            )
-            chosen = edited[edited['Pilih']]
-            if st.button('➕ Tambah ke Shortlist (CBF)', disabled=chosen.empty):
-                keep = ['Place_Id','Place_Name','Category','City']
-                st.session_state['shortlist'] = pd.concat(
-                    [st.session_state['shortlist'], chosen[keep]], ignore_index=True
-                ).drop_duplicates(subset=['Place_Id'])
-                st.success('Ditambahkan ke Shortlist.')
-
-# ---------- Tab 3: CF saja (opsional) ----------
-with tab3:
-    st.subheader('CF saja (opsional)')
-    st.caption('Butuh artifacts/cf_model.h5 + TensorFlow. Kalau tidak ada, tab ini bisa kosong.')
-    user_id_cf = st.selectbox('User ID', user_choices, index=0, key='uid_cf')
-    topn_cf = st.slider('Top-N rekomendasi', 5, 30, 10, key='topn_cf')
-
-    if st.button('Hitung rekomendasi (CF)'):
-        out = get_cf_recs(user_id_cf, places, ratings, cf_model, u2e, p2e, topn_cf)
-        if out is None:
-            st.info('CF model tidak tersedia atau User ID belum dipetakan.')
-        else:
-            out = _apply_filters(out, global_cities, global_cats, g_pmin, g_pmax)
-            out = _add_maps_link(out)
-            out_disp = out[['Place_Id','Place_Name','Category','City','CF_Score','Maps']].copy()
-            out_disp.insert(0, 'Pilih', False)
-            edited = st.data_editor(
-                out_disp, use_container_width=True, hide_index=True,
-                column_config={'Pilih': st.column_config.CheckboxColumn('Pilih'),
-                               'Maps': st.column_config.LinkColumn('Maps')}
-            )
-            chosen = edited[edited['Pilih']]
-            if st.button('➕ Tambah ke Shortlist (CF)', disabled=chosen.empty):
-                keep = ['Place_Id','Place_Name','Category','City']
-                st.session_state['shortlist'] = pd.concat(
-                    [st.session_state['shortlist'], chosen[keep]], ignore_index=True
-                ).drop_duplicates(subset=['Place_Id'])
-                st.success('Ditambahkan ke Shortlist.')
-
-# ---------- Tab 4: Mirip tempat ini ----------
-with tab4:
-    st.subheader('Mirip berdasarkan 1 tempat')
-    base_name = st.selectbox('Pilih tempat referensi', sorted(places['Place_Name'].unique().tolist()))
-    k = st.slider('Top-N kemiripan', 5, 30, 10, key='topk_similar')
-    if st.button('Cari yang mirip'):
-        if base_name not in cos_df.index:
-            st.info('Tempat tidak ada di indeks CBF.')
-        else:
-            s = cos_df[base_name].sort_values(ascending=False).drop(base_name).head(k)
-            out = places[places['Place_Name'].isin(s.index)][['Place_Id','Place_Name','Category','City']].copy()
-            out['CBF_Similarity'] = out['Place_Name'].map(s)
-            out = _apply_filters(out, global_cities, global_cats, g_pmin, g_pmax)
-            out = _add_maps_link(out)
-            out_disp = out[['Place_Id','Place_Name','Category','City','CBF_Similarity','Maps']].copy()
-            out_disp.insert(0, 'Pilih', False)
-            edited = st.data_editor(
-                out_disp, use_container_width=True, hide_index=True,
-                column_config={'Pilih': st.column_config.CheckboxColumn('Pilih'),
-                               'Maps': st.column_config.LinkColumn('Maps')}
-            )
-            chosen = edited[edited['Pilih']]
-            if st.button('➕ Tambah ke Shortlist (Mirip)', disabled=chosen.empty):
-                keep = ['Place_Id','Place_Name','Category','City']
-                st.session_state['shortlist'] = pd.concat(
-                    [st.session_state['shortlist'], chosen[keep]], ignore_index=True
-                ).drop_duplicates(subset=['Place_Id'])
-                st.success('Ditambahkan ke Shortlist.')
-
-# ===================== Shortlist =====================
-st.markdown('---')
-st.subheader('📝 Shortlist saya')
-sl = st.session_state['shortlist']
-if sl.empty:
-    st.info('Belum ada item di Shortlist. Buat rekomendasi lalu centang beberapa baris.')
+        make_cards(out)
+        csv = out[["Place_Id","Place_Name","Category","City","Price","Price_Cat","Pref_Score"]].to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download hasil (.csv)", csv, "rekomendasi.csv", "text/csv")
 else:
-    st.dataframe(sl, use_container_width=True, hide_index=True)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        csv = sl.to_csv(index=False).encode('utf-8')
-        st.download_button('⬇️ Download CSV', csv, 'shortlist.csv', 'text/csv')
-    with col2:
-        if st.button('🗑️ Bersihkan Shortlist'):
-            st.session_state['shortlist'] = pd.DataFrame(columns=sl.columns)
-            st.success('Shortlist dibersihkan.')
-    with col3:
-        st.caption('Klik kolom “Maps” di tabel rekomendasi untuk buka Google Maps.')
+    st.info("Isi preferensi di atas lalu klik **Dapatkan Rekomendasi**.")
