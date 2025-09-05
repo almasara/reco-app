@@ -149,7 +149,7 @@ with c2:
     pilih_lokasi = st.selectbox("Lokasi", CITIES, index=0)
     keywords = st.text_input("Kata Kunci (opsional)", placeholder="contoh: alam hijau air terjun instagramable")
 
-topn = st.slider("Jumlah rekomendasi", 4, 24, 8, 2)
+topn = st.slider("Jumlah rekomendasi", min_value=4, max_value=24, value=10, step=2)
 go = st.button("Dapatkan Rekomendasi", type="primary")
 
 # ============ HASIL ============
